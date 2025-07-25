@@ -1,0 +1,580 @@
+# Monitoring Stack for FSDP Training
+# Includes Prometheus, Grafana, and custom dashboards
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# Prometheus Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      
+    scrape_configs:
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - ml-training
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+)(?::\d+)?
+        replacement: $1:${__meta_kubernetes_pod_annotation_prometheus_io_port}
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: kubernetes_pod_name
+        
+    - job_name: 'pushgateway'
+      static_configs:
+      - targets: ['prometheus-pushgateway:9091']
+      
+    - job_name: 'node-exporter'
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):10250'
+        replacement: '${1}:9100'
+        target_label: __address__
+        
+    - job_name: 'nvidia-dcgm'
+      static_configs:
+      - targets: ['nvidia-dcgm-exporter:9400']
+---
+# Prometheus Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus'
+        - '--storage.tsdb.retention.time=30d'
+        - '--web.enable-lifecycle'
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: storage
+          mountPath: /prometheus
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 2
+            memory: 8Gi
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+      - name: storage
+        persistentVolumeClaim:
+          claimName: prometheus-pvc
+---
+# Prometheus Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - port: 9090
+    targetPort: 9090
+  type: ClusterIP
+---
+# Prometheus PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-pvc
+  namespace: monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: gp3
+---
+# Prometheus ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+# Prometheus ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/metrics
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions"]
+  resources:
+  - ingresses
+  verbs: ["get", "list", "watch"]
+---
+# Prometheus ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring
+---
+# Prometheus Pushgateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-pushgateway
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-pushgateway
+  template:
+    metadata:
+      labels:
+        app: prometheus-pushgateway
+    spec:
+      containers:
+      - name: pushgateway
+        image: prom/pushgateway:v1.6.2
+        ports:
+        - containerPort: 9091
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+# Pushgateway Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-pushgateway
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus-pushgateway
+  ports:
+  - port: 9091
+    targetPort: 9091
+---
+# Grafana ConfigMap for Dashboards
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  fsdp-training-dashboard.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "uid": "fsdp-training",
+        "title": "FSDP Training Dashboard",
+        "tags": ["ml", "training", "fsdp"],
+        "timezone": "browser",
+        "schemaVersion": 30,
+        "version": 1,
+        "panels": [
+          {
+            "id": 1,
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "type": "graph",
+            "title": "Training Loss",
+            "targets": [
+              {
+                "expr": "training_loss",
+                "legendFormat": "Node {{node}} - Rank {{rank}}"
+              }
+            ],
+            "yaxes": [{"format": "short", "show": true}, {"show": false}]
+          },
+          {
+            "id": 2,
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+            "type": "graph",
+            "title": "Training Throughput (tokens/sec)",
+            "targets": [
+              {
+                "expr": "training_throughput_tokens_per_sec",
+                "legendFormat": "Node {{node}} - Rank {{rank}}"
+              }
+            ],
+            "yaxes": [{"format": "short", "show": true}, {"show": false}]
+          },
+          {
+            "id": 3,
+            "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+            "type": "graph",
+            "title": "GPU Utilization %",
+            "targets": [
+              {
+                "expr": "gpu_utilization_percent",
+                "legendFormat": "GPU {{gpu_id}} - Node {{node}}"
+              }
+            ],
+            "yaxes": [{"format": "percent", "max": 100, "min": 0}, {"show": false}]
+          },
+          {
+            "id": 4,
+            "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+            "type": "graph",
+            "title": "GPU Memory Usage",
+            "targets": [
+              {
+                "expr": "gpu_memory_used_bytes / 1e9",
+                "legendFormat": "GPU {{gpu_id}} - Node {{node}}"
+              }
+            ],
+            "yaxes": [{"format": "GB", "show": true}, {"show": false}]
+          },
+          {
+            "id": 5,
+            "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+            "type": "graph",
+            "title": "Accumulated Cost (USD)",
+            "targets": [
+              {
+                "expr": "accumulated_cost_usd",
+                "legendFormat": "Total Cost"
+              }
+            ],
+            "yaxes": [{"format": "currencyUSD", "show": true}, {"show": false}]
+          },
+          {
+            "id": 6,
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+            "type": "graph",
+            "title": "Batch Processing Time",
+            "targets": [
+              {
+                "expr": "rate(batch_processing_time_seconds_sum[5m]) / rate(batch_processing_time_seconds_count[5m])",
+                "legendFormat": "Avg Batch Time - Node {{node}}"
+              }
+            ],
+            "yaxes": [{"format": "s", "show": true}, {"show": false}]
+          },
+          {
+            "id": 7,
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+            "type": "graph",
+            "title": "Network I/O",
+            "targets": [
+              {
+                "expr": "rate(network_sent_bytes_total[5m])",
+                "legendFormat": "Sent - Node {{node}}"
+              },
+              {
+                "expr": "rate(network_recv_bytes_total[5m])",
+                "legendFormat": "Received - Node {{node}}"
+              }
+            ],
+            "yaxes": [{"format": "Bps", "show": true}, {"show": false}]
+          },
+          {
+            "id": 8,
+            "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+            "type": "stat",
+            "title": "Current Spot Price",
+            "targets": [
+              {
+                "expr": "spot_price_per_hour_usd",
+                "legendFormat": "{{instance_type}}"
+              }
+            ],
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "center"
+            }
+          },
+          {
+            "id": 9,
+            "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+            "type": "graph",
+            "title": "GPU Temperature",
+            "targets": [
+              {
+                "expr": "gpu_temperature_celsius",
+                "legendFormat": "GPU {{gpu_id}} - Node {{node}}"
+              }
+            ],
+            "yaxes": [{"format": "celsius", "show": true}, {"show": false}],
+            "alert": {
+              "conditions": [
+                {
+                  "evaluator": {"params": [85], "type": "gt"},
+                  "operator": {"type": "and"},
+                  "query": {"params": ["A", "5m", "now"]},
+                  "reducer": {"params": [], "type": "avg"},
+                  "type": "query"
+                }
+              ],
+              "name": "High GPU Temperature Alert"
+            }
+          },
+          {
+            "id": 10,
+            "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
+            "type": "table",
+            "title": "Training Summary",
+            "targets": [
+              {
+                "expr": "training_loss",
+                "format": "table",
+                "instant": true
+              }
+            ]
+          }
+        ]
+      }
+    }
+---
+# Grafana Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.0.3
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: grafana-admin
+              key: password
+        - name: GF_INSTALL_PLUGINS
+          value: "grafana-piechart-panel,grafana-worldmap-panel"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/grafana/provisioning/datasources
+        - name: dashboards-config
+          mountPath: /etc/grafana/provisioning/dashboards
+        - name: dashboards
+          mountPath: /var/lib/grafana/dashboards
+        - name: storage
+          mountPath: /var/lib/grafana
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 1
+            memory: 1Gi
+      volumes:
+      - name: config
+        configMap:
+          name: grafana-datasources
+      - name: dashboards-config
+        configMap:
+          name: grafana-dashboard-provider
+      - name: dashboards
+        configMap:
+          name: grafana-dashboards
+      - name: storage
+        persistentVolumeClaim:
+          claimName: grafana-pvc
+---
+# Grafana Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: 3000
+    targetPort: 3000
+  type: LoadBalancer
+---
+# Grafana PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: gp3
+---
+# Grafana Datasources ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  prometheus.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus:9090
+      isDefault: true
+      editable: false
+---
+# Grafana Dashboard Provider ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: monitoring
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+    - name: 'default'
+      orgId: 1
+      folder: 'ML Training'
+      type: file
+      disableDeletion: false
+      updateIntervalSeconds: 10
+      allowUiUpdates: true
+      options:
+        path: /var/lib/grafana/dashboards
+---
+# Grafana Admin Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-admin
+  namespace: monitoring
+type: Opaque
+stringData:
+  password: "admin123"  # Change this in production!
+---
+# NVIDIA DCGM Exporter for GPU metrics
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-dcgm-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app: nvidia-dcgm-exporter
+    spec:
+      nodeSelector:
+        nvidia.com/gpu: "true"
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: nvidia-dcgm-exporter
+        image: nvcr.io/nvidia/k8s/dcgm-exporter:3.2.5-3.1.8-ubuntu20.04
+        ports:
+        - containerPort: 9400
+        securityContext:
+          privileged: true
+        env:
+        - name: DCGM_EXPORTER_LISTEN
+          value: ":9400"
+        - name: DCGM_EXPORTER_KUBERNETES
+          value: "true"
+        volumeMounts:
+        - name: pod-gpu-resources
+          mountPath: /var/lib/kubelet/pod-resources
+          readOnly: true
+      volumes:
+      - name: pod-gpu-resources
+        hostPath:
+          path: /var/lib/kubelet/pod-resources
+---
+# DCGM Exporter Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: nvidia-dcgm-exporter
+  namespace: monitoring
+spec:
+  selector:
+    app: nvidia-dcgm-exporter
+  ports:
+  - port: 9400
+    targetPort: 9400
+  type: ClusterIP

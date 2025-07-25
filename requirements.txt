@@ -1,0 +1,70 @@
+# Core ML Libraries
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.35.0
+datasets>=2.14.0
+accelerate>=0.24.0
+sentencepiece>=0.1.99
+
+# Distributed Training
+fairscale>=0.4.13
+deepspeed>=0.12.0
+
+# Orchestration & Infrastructure
+metaflow>=2.10.0
+kubernetes>=28.1.0
+boto3>=1.28.0
+minio>=7.2.0
+
+# Monitoring & Tracking
+wandb>=0.16.0
+prometheus-client>=0.19.0
+grafana-api>=1.0.3
+tensorboard>=2.14.0
+mlflow>=2.8.0
+
+# Optimization & Performance
+apex @ git+https://github.com/NVIDIA/apex
+nvidia-ml-py>=12.535.0
+pynvml>=11.5.0
+
+# Data Processing
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+fastparquet>=2023.10.0
+
+# Utilities
+pyyaml>=6.0.1
+click>=8.1.0
+rich>=13.6.0
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Development & Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0
+black>=23.10.0
+flake8>=6.1.0
+mypy>=1.6.0
+pre-commit>=3.5.0
+
+# Documentation
+mkdocs>=1.5.0
+mkdocs-material>=9.4.0
+mkdocstrings>=0.23.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.13.0
+plotly>=5.17.0
+
+# Cloud Providers
+azure-storage-blob>=12.19.0
+google-cloud-storage>=2.12.0
+
+# Security
+cryptography>=41.0.0
+paramiko>=3.3.0

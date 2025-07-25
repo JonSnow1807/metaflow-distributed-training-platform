@@ -1,0 +1,492 @@
+# Distributed Training Job for FSDP with Metaflow
+# Supports multi-node training with automatic recovery
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-training
+  labels:
+    name: ml-training
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: training-sa
+  namespace: ml-training
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: training-role
+  namespace: ml-training
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: training-rolebinding
+  namespace: ml-training
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: training-role
+subjects:
+- kind: ServiceAccount
+  name: training-sa
+  namespace: ml-training
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: training-config
+  namespace: ml-training
+data:
+  master_addr: "distributed-training-master"
+  master_port: "29500"
+  nccl_debug: "INFO"
+  pytorch_cuda_alloc_conf: "max_split_size_mb:512"
+  cuda_launch_blocking: "0"
+  omp_num_threads: "12"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: distributed-training-master
+  namespace: ml-training
+spec:
+  selector:
+    app: distributed-training
+    role: master
+  ports:
+  - name: nccl
+    port: 29500
+    targetPort: 29500
+  - name: torch-elastic
+    port: 29501
+    targetPort: 29501
+  clusterIP: None  # Headless service
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distributed-training-master
+  namespace: ml-training
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: distributed-training
+        role: master
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: training-sa
+      restartPolicy: OnFailure
+      
+      # Node affinity for GPU nodes
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                - p4d.24xlarge
+                - p4de.24xlarge
+              - key: nvidia.com/gpu
+                operator: Exists
+                
+      # Tolerations for GPU and spot nodes
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      - key: spot
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+        
+      # Init container to wait for workers
+      initContainers:
+      - name: wait-for-workers
+        image: busybox:1.35
+        command: ['sh', '-c', 'echo "Waiting for worker nodes..." && sleep 30']
+        
+      containers:
+      - name: training
+        image: nvcr.io/nvidia/pytorch:23.10-py3
+        imagePullPolicy: Always
+        
+        # Resource requests and limits
+        resources:
+          requests:
+            cpu: "96"
+            memory: "768Gi"
+            nvidia.com/gpu: "8"
+          limits:
+            cpu: "96"
+            memory: "768Gi"
+            nvidia.com/gpu: "8"
+            
+        # Environment variables
+        env:
+        - name: RANK
+          value: "0"
+        - name: LOCAL_RANK
+          value: "0"
+        - name: WORLD_SIZE
+          value: "4"  # Total number of nodes
+        - name: MASTER_ADDR
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: master_addr
+        - name: MASTER_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: master_port
+        - name: NCCL_DEBUG
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: nccl_debug
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: pytorch_cuda_alloc_conf
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: access_key_id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: secret_access_key
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-credentials
+              key: api_key
+        - name: USE_SPOT
+          value: "true"
+        - name: INSTANCE_TYPE
+          value: "p4d.24xlarge"
+        - name: PROMETHEUS_GATEWAY
+          value: "prometheus-pushgateway.monitoring:9091"
+          
+        # Mount volumes
+        volumeMounts:
+        - name: training-code
+          mountPath: /app
+        - name: dataset-cache
+          mountPath: /data
+        - name: checkpoint-storage
+          mountPath: /checkpoints
+        - name: shm
+          mountPath: /dev/shm
+          
+        # Command to run
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -ex
+          cd /app
+          pip install -e .
+          python examples/train_llama_fsdp.py run \
+            --num-nodes 4 \
+            --batch-size 32 \
+            --epochs 3 \
+            --use-spot true \
+            --checkpoint-interval 1000
+            
+        # Liveness and readiness probes
+        livenessProbe:
+          exec:
+            command:
+            - nvidia-smi
+          initialDelaySeconds: 30
+          periodSeconds: 60
+          
+      volumes:
+      - name: training-code
+        persistentVolumeClaim:
+          claimName: training-code-pvc
+      - name: dataset-cache
+        persistentVolumeClaim:
+          claimName: dataset-cache-pvc
+      - name: checkpoint-storage
+        persistentVolumeClaim:
+          claimName: checkpoint-storage-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 256Gi
+---
+# Worker StatefulSet for distributed training
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: distributed-training-workers
+  namespace: ml-training
+spec:
+  serviceName: distributed-training-workers
+  replicas: 3  # 3 worker nodes (master + 3 workers = 4 total)
+  selector:
+    matchLabels:
+      app: distributed-training
+      role: worker
+  template:
+    metadata:
+      labels:
+        app: distributed-training
+        role: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: training-sa
+      
+      # Same affinity and tolerations as master
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                - p4d.24xlarge
+                - p4de.24xlarge
+              - key: nvidia.com/gpu
+                operator: Exists
+        # Anti-affinity to spread across nodes
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - distributed-training
+            topologyKey: kubernetes.io/hostname
+            
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      - key: spot
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+        
+      containers:
+      - name: training
+        image: nvcr.io/nvidia/pytorch:23.10-py3
+        imagePullPolicy: Always
+        
+        resources:
+          requests:
+            cpu: "96"
+            memory: "768Gi"
+            nvidia.com/gpu: "8"
+          limits:
+            cpu: "96"
+            memory: "768Gi"
+            nvidia.com/gpu: "8"
+            
+        env:
+        # Rank will be set based on pod ordinal
+        - name: RANK_OFFSET
+          value: "1"  # Workers start from rank 1
+        - name: LOCAL_RANK
+          value: "0"
+        - name: WORLD_SIZE
+          value: "4"
+        - name: MASTER_ADDR
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: master_addr
+        - name: MASTER_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: master_port
+        - name: NCCL_DEBUG
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: nccl_debug
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: pytorch_cuda_alloc_conf
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: access_key_id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aws-credentials
+              key: secret_access_key
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-credentials
+              key: api_key
+        - name: USE_SPOT
+          value: "true"
+        - name: INSTANCE_TYPE
+          value: "p4d.24xlarge"
+        - name: PROMETHEUS_GATEWAY
+          value: "prometheus-pushgateway.monitoring:9091"
+          
+        volumeMounts:
+        - name: training-code
+          mountPath: /app
+        - name: dataset-cache
+          mountPath: /data
+        - name: checkpoint-storage
+          mountPath: /checkpoints
+        - name: shm
+          mountPath: /dev/shm
+          
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -ex
+          # Calculate rank from pod ordinal
+          POD_ORDINAL=${HOSTNAME##*-}
+          export RANK=$((POD_ORDINAL + RANK_OFFSET))
+          echo "Starting worker with RANK=$RANK"
+          
+          cd /app
+          pip install -e .
+          python examples/train_llama_fsdp.py run \
+            --num-nodes 4 \
+            --batch-size 32 \
+            --epochs 3 \
+            --use-spot true \
+            --checkpoint-interval 1000
+            
+        livenessProbe:
+          exec:
+            command:
+            - nvidia-smi
+          initialDelaySeconds: 30
+          periodSeconds: 60
+          
+      volumes:
+      - name: training-code
+        persistentVolumeClaim:
+          claimName: training-code-pvc
+      - name: dataset-cache
+        persistentVolumeClaim:
+          claimName: dataset-cache-pvc
+      - name: checkpoint-storage
+        persistentVolumeClaim:
+          claimName: checkpoint-storage-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 256Gi
+---
+# PVC for training code
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-code-pvc
+  namespace: ml-training
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: efs-sc  # Use EFS for shared access
+  resources:
+    requests:
+      storage: 10Gi
+---
+# PVC for dataset cache
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dataset-cache-pvc
+  namespace: ml-training
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 1Ti
+---
+# PVC for checkpoints
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoint-storage-pvc
+  namespace: ml-training
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 500Gi
+---
+# Secrets for AWS credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aws-credentials
+  namespace: ml-training
+type: Opaque
+stringData:
+  access_key_id: YOUR_AWS_ACCESS_KEY_ID
+  secret_access_key: YOUR_AWS_SECRET_ACCESS_KEY
+---
+# Secrets for W&B
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wandb-credentials
+  namespace: ml-training
+type: Opaque
+stringData:
+  api_key: YOUR_WANDB_API_KEY

@@ -1,0 +1,217 @@
+# Training configuration for FSDP distributed training
+# Optimized for 7B parameter models on multi-node setups
+
+model:
+  name: "meta-llama/Llama-2-7b-hf"
+  type: "causal_lm"
+  vocab_size: 32000
+  hidden_size: 4096
+  num_hidden_layers: 32
+  num_attention_heads: 32
+  intermediate_size: 11008
+  max_position_embeddings: 4096
+  use_cache: false  # Disable KV cache for training
+
+training:
+  # Batch configuration
+  batch_size_per_gpu: 4
+  gradient_accumulation_steps: 8
+  sequence_length: 2048
+  
+  # Optimization
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  
+  # Schedule
+  warmup_steps: 2000
+  num_train_epochs: 3
+  max_steps: -1  # If > 0, overrides num_train_epochs
+  
+  # Checkpointing
+  checkpoint_interval: 1000
+  save_total_limit: 3
+  resume_from_checkpoint: true
+  
+  # Evaluation
+  eval_interval: 500
+  eval_steps: 100
+  
+  # Early stopping
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.01
+
+distributed:
+  backend: "nccl"
+  init_method: "env://"
+  world_size: 4
+  find_unused_parameters: false
+  gradient_as_bucket_view: true
+  
+  # FSDP configuration
+  fsdp:
+    sharding_strategy: "full_shard"  # full_shard, shard_grad_op, no_shard
+    cpu_offload: false
+    backward_prefetch: "backward_pre"
+    forward_prefetch: true
+    limit_all_gathers: true
+    use_orig_params: true
+    sync_module_states: true
+    
+  # Mixed precision
+  mixed_precision:
+    enabled: true
+    dtype: "bfloat16"  # fp16, bfloat16
+    loss_scale: "dynamic"
+    initial_scale: 2048
+    growth_interval: 2000
+    
+  # Communication optimization
+  communication:
+    compression: "none"  # none, fp16, powersgd
+    all_reduce_bucket_size: 200_000_000  # 200MB
+    broadcast_buffers: false
+
+optimization:
+  # Memory optimization
+  gradient_checkpointing: true
+  activation_checkpointing_ratio: 0.5
+  memory_efficient_attention: true
+  
+  # Dynamic batching
+  dynamic_batch_size:
+    enabled: true
+    min_batch_size: 1
+    max_batch_size: 16
+    memory_threshold: 0.9
+    adjustment_interval: 100
+    
+  # CPU offloading
+  offload_optimizer: false
+  offload_params: false
+  
+  # Flash Attention
+  use_flash_attention: true
+  flash_attention_version: 2
+
+dataset:
+  name: "c4"
+  train_split: "train"
+  validation_split: "validation"
+  streaming: true
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+  
+  # Preprocessing
+  preprocessing:
+    tokenizer_parallelism: true
+    max_length: 2048
+    truncation: true
+    padding: "max_length"
+    return_attention_mask: true
+
+monitoring:
+  # Weights & Biases
+  wandb:
+    enabled: true
+    project: "fsdp-training"
+    entity: null  # Your W&B entity
+    tags: ["fsdp", "7b", "production"]
+    log_interval: 10
+    log_gradients: true
+    log_model: false  # Too large for 7B
+    
+  # Prometheus metrics
+  prometheus:
+    enabled: true
+    pushgateway_url: "http://prometheus-pushgateway:9091"
+    push_interval: 30
+    
+  # TensorBoard
+  tensorboard:
+    enabled: true
+    log_dir: "./logs/tensorboard"
+    
+  # Custom metrics
+  log_memory_usage: true
+  log_communication_stats: true
+  log_gpu_utilization: true
+
+infrastructure:
+  # Instance configuration
+  instance_type: "p4d.24xlarge"
+  num_gpus_per_node: 8
+  
+  # Spot instances
+  use_spot_instances: true
+  spot_price_threshold: 15.0  # USD per hour
+  fallback_to_on_demand: true
+  
+  # Storage
+  checkpoint_storage:
+    backend: "s3"  # s3, gcs, azure, local
+    bucket: "your-checkpoint-bucket"
+    prefix: "fsdp-checkpoints"
+    
+  # Networking
+  network:
+    placement_group: true
+    enhanced_networking: true
+    
+  # Fault tolerance
+  fault_tolerance:
+    max_node_failures: 1
+    checkpoint_on_preemption: true
+    elastic_training: true
+    min_nodes: 2
+    max_nodes: 8
+
+# Cost optimization settings
+cost_optimization:
+  enabled: true
+  target_budget: 1000.0  # USD
+  hourly_budget: 50.0    # USD per hour
+  
+  # Region selection
+  regions:
+    - "us-east-1"
+    - "us-west-2"
+    - "eu-west-1"
+    - "ap-southeast-1"
+    
+  # Instance preferences (in order)
+  instance_preferences:
+    - "p4d.24xlarge"
+    - "p4de.24xlarge"
+    - "p3dn.24xlarge"
+    - "g5.48xlarge"
+    
+  # Scheduling
+  preferred_hours: [2, 3, 4, 5, 6]  # 2 AM - 7 AM
+  avoid_hours: [9, 10, 11, 14, 15, 16, 17]  # Business hours
+  
+  # Savings requirements
+  minimum_savings_percent: 50.0
+  
+# Advanced features
+advanced:
+  # Gradient accumulation optimization
+  micro_batch_size: "auto"  # Automatically determine
+  
+  # Communication patterns
+  hierarchical_allreduce: true
+  compression_algorithm: null
+  
+  # Debugging
+  debug_mode: false
+  profile_execution: false
+  trace_memory_usage: false
+  
+  # Experimental features
+  compile_model: false  # torch.compile
+  use_fused_adam: true
+  use_apex_amp: false  # Use native AMP instead
